@@ -66,7 +66,7 @@ def vector_add_tiled(a_vec, b_vec):
     M = a_vec.shape[0]
     
     # TODO: You should modify this variable for Step 1
-    ROW_CHUNK = 128
+    ROW_CHUNK = 1
 
     # Loop over the total number of chunks, we can use affine_range
     # because there are no loop-carried dependencies
@@ -133,6 +133,38 @@ def vector_add_stream(a_vec, b_vec):
 
     return out
 
+# """
+# This kernel implements a simple 2D matrix transpose.
+# It uses a tile-based approach along with NKI's built-in transpose kernel,
+# which only works on tiles of size <= 128x128.
+# """
+# @nki.compiler.skip_middle_end_transformations
+# @nki.jit
+# def matrix_transpose(a_tensor):
+#     M, N = a_tensor.shape
+#     out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
+#     tile_dim = nl.tile_size.pmax  # this should be 128
+
+#     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
+
+#     TILE_DIM = 128
+
+#     # Loop over the total number of tiles
+#     for m in nl.affine_range(M // TILE_DIM):
+#         for n in nl.affine_range(N // TILE_DIM):
+#             # Allocate space for tile
+#             a_tile = nl.ndarray((TILE_DIM, TILE_DIM), dtype=a_tensor.dtype, buffer=nl.sbuf)
+#             # Copy data into the tlie
+#             nisa.dma_copy(src=a_tensor[n * TILE_DIM : (n + 1) * TILE_DIM, m * TILE_DIM : (m + 1) * TILE_DIM], dst=a_tile)
+#             # Compute the transpose of the tile
+#             result = nisa.nc_transpose(data=a_tile)
+#             # Result is a PSUM tile, so copy it to SBUF
+#             result_copy = nisa.tensor_copy(result)
+#             # Store the result tile into HBM
+#             nisa.dma_copy(src=result_copy, dst=out[m * TILE_DIM : (m + 1) * TILE_DIM, n * TILE_DIM : (n + 1) * TILE_DIM])
+#     return out
+
+
 """
 This kernel implements a simple 2D matrix transpose.
 It uses a tile-based approach along with NKI's built-in transpose kernel,
@@ -144,9 +176,25 @@ def matrix_transpose(a_tensor):
     M, N = a_tensor.shape
     out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
     tile_dim = nl.tile_size.pmax  # this should be 128
-
+    
+    TILE_DIMENSION = 128  
+    TILES_PER_BATCH = 16
+    OVERSIZED_HEIGHT = TILE_DIMENSION * TILES_PER_BATCH
+    
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
-
-    # TODO: Your implementation here. The only compute instruction you should use is `nisa.nc_transpose`.
-
+    assert M % OVERSIZED_HEIGHT == N % OVERSIZED_HEIGHT == 0, "Matrix dimensions not divisible by tile dimension!"
+    
+    # Loop over batches of tiles
+    for m in nl.affine_range(M // TILE_DIMENSION):
+        for n in nl.affine_range(N // OVERSIZED_HEIGHT):
+            # Load a 128x512 tile
+            a_tile = nl.ndarray((TILE_DIMENSION, OVERSIZED_HEIGHT), dtype=a_tensor.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(src=a_tensor[m * TILE_DIMENSION : (m + 1) * TILE_DIMENSION, n * OVERSIZED_HEIGHT : (n + 1) * OVERSIZED_HEIGHT], dst=a_tile)
+            # Transpose each 128x128 sub-tile
+            for i in nl.affine_range(TILES_PER_BATCH):
+                sub_tile = a_tile[:, i * TILE_DIMENSION : (i + 1) * TILE_DIMENSION]
+                result = nisa.nc_transpose(data=sub_tile)
+                result_copy = nl.copy(result, dtype=a_tensor.dtype)
+                nisa.dma_copy(src=result_copy, dst=out[(n * TILES_PER_BATCH + i) * TILE_DIMENSION : (n * TILES_PER_BATCH + i + 1) * TILE_DIMENSION, m * TILE_DIMENSION : (m + 1) * TILE_DIMENSION])
+    
     return out
