@@ -143,8 +143,8 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
         dtype=X.dtype,
         buffer=nl.hbm,
     )
-    print("X_out shape:")
-    print(X_out.shape)
+    # print("X_out shape:")
+    # print(X_out.shape)
 
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
@@ -152,48 +152,38 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     k = out_channels // (filter_height * filter_height)
     # Process the images in batches
    
-    # flatten image
-    print("x shape:")
-    print(X.shape)
-    x_re = X.reshape(shape=(batch_size, in_channels, (input_height * input_width)))
-    print("x_re shape:")
-    print(x_re.shape)
+    # # flatten image
+    # print("x shape:")
+    # print(X.shape)
+    # x_re = X.reshape(shape=(batch_size, in_channels, (input_height * input_width)))
+    # print("x_re shape:")
+    # print(x_re.shape)
 
-    # flatten filters
-    print("w shape:")
-    print(W.shape)
-    w_re = W.reshape(shape=(out_channels, in_channels, filter_height * filter_width))
-    print("w_re shape:")
-    print(w_re.shape)
+    # # flatten filters
+    # print("w shape:")
+    # print(W.shape)
+    # w_re = W.reshape(shape=(out_channels, in_channels, filter_height * filter_width))
+    # print("w_re shape:")
+    # print(w_re.shape)
 
-    x_re_T = nl.ndarray(shape=(batch_size, (input_height * input_width), in_channels), dtype=X.dtype, buffer=nl.hbm)
+    # x_re_T = nl.ndarray(shape=(batch_size, (input_height * input_width), in_channels), dtype=X.dtype, buffer=nl.hbm)
+    # for b in nl.affine_range(batch_size):
+    #     out = matrix_transpose(x_re[b])
+    #     nisa.dma_copy(src=out, dst=x_re_T[b])
+    # print("x_re_T shape:")
+    # print(x_re_T.shape)
+
     for b in nl.affine_range(batch_size):
-        out = matrix_transpose(x_re[b])
-        nisa.dma_copy(src=out, dst=x_re_T[b])
-    print("x_re_T shape:")
-    print(x_re_T.shape)
-
-    # loop over the batches (different input images)
-    for b in nl.affine_range(batch_size):
-        # tiling the image into filter-size matrixes
-        for m in nl.affine_range(input_height):
-            for n in nl.affine_range(input_width):
-                tile = nl.ndarray(shape=((filter_height * filter_width), input_channels), dtype=X.dtype, buffer=nl.hbm)
-                print("tile shape:")
-                print(tile.shape)
-                # # Create RELATIVE indices (compile-time constants)
-                # # i_p, i_f = nl.mgrid[0:filter_height, 0:filter_width]
-                # # linear_idx = (m+i_p)*input_width + (n+i_f)
-                
-                # # Add loop variables when indexing (runtime values)
-                # nisa.dma_copy(src= x_T[b, m*input_width+n:m*input_width+n+filter_height*filter_width, :], dst = tile)
-                # tile.reshape(shape= (input_height * input_width), in_channels)
-                # result = nl.ndarray(shape = (filter_height, filter_width), dtype = X.dtype, buffer = nl.psum)
-
-                # # loop over the filters
-                # for o in nl.affine_range(out_channels):
-                #     nki_matmul_tiled_(tile, w_re[o], result)
-                #     nisa.dma_copy(result, X_out[])
+        for i in nl.affine_range(filter_height):
+            for j in nl.affine_range(filter_width):
+                result = nl.ndarray(shape = ((input_height - filter_height + 1) * (input_width - filter_width + 1), out_channels), dtype = X.dtype, buffer = nl.psum)
+                input_tile = nl.ndarray(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), input_channels), dtype=X.dtype, buffer=nl.hbm)
+                nisa.dma_copy(src= X[b, : , i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1), dst = input_tile)
+                filter_tile = nl.ndarray(shape=(out_channels, in_channels), dtype=W.dtype, buffer=nl.hbm)
+                nisa.dma_copy(src= W[ : , : , i : i + 1, j : j+ 1], dst = filter_tile)
+                nki_matmul_tiled_(filter_tile, input_tile, result)
+                # add the result to the output
+                nisa.dma_copy(src=result, dst=X_out[b, :, i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1)], dst_rmw_op=np.add)
 
     return X_out
 
