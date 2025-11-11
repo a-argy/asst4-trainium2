@@ -17,10 +17,6 @@ which only works on tiles of size <= 128x128.
 @nki.jit
 def matrix_transpose(a_tensor):
     M, N = a_tensor.shape
-    print("M:")
-    print(M)
-    print("N:")
-    print(N)
     out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
     tile_dim = nl.tile_size.pmax  # this should be 128
     
@@ -117,7 +113,7 @@ The shape of the output should be [batch_size, out_channels, out_pool_height, ou
 """
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def fused_conv2d_maxpool(X, W, bias, pool_size=1):
+def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
 
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
@@ -142,82 +138,62 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Can assume one PSUM bank can at least fit one row of the pixels
     assert nl.tile_size.gemm_moving_fmax >= out_width
 
-    # Initialize output array
-    # X_out = nl.ndarray(
-    #     shape=(batch_size, out_channels * filter_height * filter_width, input_height * input_width, out_pool_height * out_pool_width),
-    #     dtype=X.dtype,
-    #     buffer=nl.hbm,
-    # )
-
     X_out = nl.ndarray(
         shape=(batch_size, out_channels, out_pool_height, out_pool_width),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
+    print("X_out shape:")
+    print(X_out.shape)
 
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
     k = out_channels // (filter_height * filter_height)
+    # Process the images in batches
    
     # flatten image
+    print("x shape:")
+    print(X.shape)
     x_re = X.reshape(shape=(batch_size, in_channels, (input_height * input_width)))
+    print("x_re shape:")
+    print(x_re.shape)
 
     # flatten filters
-    w_re = W.reshape(shape=(out_channels, filter_height * filter_width, in_channels))
-    
-    x_T = nl.ndarray(shape=(batch_size, input_width, input_height, in_channels), dtype=X.dtype, buffer=nl.hbm)
-    # Allocate buffer in SBUF with the same shape
-    # X_sbuf = nl.ndarray(shape=(batch_size, input_height, input_width, in_channels), dtype=X.dtype, buffer=nl.sbuf)
+    print("w shape:")
+    print(W.shape)
+    w_re = W.reshape(shape=(out_channels, in_channels, filter_height * filter_width))
+    print("w_re shape:")
+    print(w_re.shape)
 
-    # DMA copy from HBM to SBUF
-    
-    # x_T = nl.transpose(X_buf, axes=(0, 2, 3, 1))
+    x_re_T = nl.ndarray(shape=(batch_size, (input_height * input_width), in_channels), dtype=X.dtype, buffer=nl.hbm)
     for b in nl.affine_range(batch_size):
-        for i in nl.affine_range(in_channels):
-            for m in nl.affine_range(out_height):
-                for n in nl.affine_range(out_width):
-                    nisa.dma_copy(src = X[b,i,m,n], dst = x_T[b,n,m,i]) 
-    
+        out = matrix_transpose(x_re[b])
+        nisa.dma_copy(src=out, dst=x_re_T[b])
+    print("x_re_T shape:")
+    print(x_re_T.shape)
+
+    # loop over the batches (different input images)
     for b in nl.affine_range(batch_size):
-        # tiling the image into filter-size matrixes for mat mul 
-        for m in nl.affine_range(out_height):
-            for n in nl.affine_range(out_width):
-                tile = nl.ndarray(shape=(filter_height, filter_width, in_channels), dtype=X.dtype, buffer=nl.hbm)
+        # tiling the image into filter-size matrixes
+        for m in nl.affine_range(input_height):
+            for n in nl.affine_range(input_width):
+                tile = nl.ndarray(shape=((filter_height * filter_width), input_channels), dtype=X.dtype, buffer=nl.hbm)
+                print("tile shape:")
+                print(tile.shape)
+                # # Create RELATIVE indices (compile-time constants)
+                # # i_p, i_f = nl.mgrid[0:filter_height, 0:filter_width]
+                # # linear_idx = (m+i_p)*input_width + (n+i_f)
                 
-                # Add loop variables when indexing (runtime values)
-                nisa.dma_copy(src= x_T[b, n: n + filter_width, m: m + filter_height, :], dst = tile)
-                tile_input_height, tile_input_width, tile_in_channels = tile.shape
-                flat_tile = tile.reshape((tile_input_height * tile_input_width, tile_in_channels))
-                result = nl.ndarray(shape = (filter_height * filter_width, filter_height * filter_width), dtype = X.dtype, buffer = nl.psum)
-                for o in nl.affine_range(out_channels):
+                # # Add loop variables when indexing (runtime values)
+                # nisa.dma_copy(src= x_T[b, m*input_width+n:m*input_width+n+filter_height*filter_width, :], dst = tile)
+                # tile.reshape(shape= (input_height * input_width), in_channels)
+                # result = nl.ndarray(shape = (filter_height, filter_width), dtype = X.dtype, buffer = nl.psum)
 
-                    nki_matmul_tiled_(flat_tile, w_re[o], result)
-                    
-                    # sum up result into X_out
-                    # Step 1: Reduce over axis=1 (non-partition axis)
-                    partial = nl.zeros((result.shape[0], 1), dtype=result.dtype, buffer=nl.sbuf)
-                    partial = nisa.tensor_reduce(op=nl.add, data=result, axis=1)
+                # # loop over the filters
+                # for o in nl.affine_range(out_channels):
+                #     nki_matmul_tiled_(tile, w_re[o], result)
+                #     nisa.dma_copy(result, X_out[])
 
-                    # Step 2: Reduce manually over axis=0 (partition axis)
-                    total = nl.zeros((1, 1), dtype=result.dtype, buffer=nl.sbuf)
-                    for i in nl.affine_range(result.shape[0]):
-                        nisa.tensor_scalar(op0=nl.add, data=total[0, 0], operand0=partial[i, 0])
-
-
-                    # 1. Allocate temp buffer in SBUF
-                    temp_out = nl.zeros((1, 1), dtype=X_out.dtype, buffer=nl.sbuf)
-
-                    # 2. Copy from HBM to SBUF
-                    nisa.dma_copy(dst=temp_out, src=X_out[b, o, m, n])
-
-                    # 3. Apply tensor_scalar
-                    nisa.tensor_scalar(data=temp_out, operand0=total[0, 0], op0=nl.add)
-
-                    # 4. Copy back to HBM
-                    nisa.dma_copy(dst=X_out[b, o, m, n], src=temp_out)
-
-            
-        
     return X_out
 
