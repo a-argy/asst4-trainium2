@@ -17,10 +17,14 @@ which only works on tiles of size <= 128x128.
 @nki.jit
 def matrix_transpose(a_tensor):
     M, N = a_tensor.shape
+    print("M:")
+    print(M)
+    print("N:")
+    print(N)
     out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
     tile_dim = nl.tile_size.pmax  # this should be 128
     
-    TILE_DIMENSION = 128  
+    TILE_DIMENSION = 128
     TILES_PER_BATCH = 1
     OVERSIZED_HEIGHT = TILE_DIMENSION * TILES_PER_BATCH
     
@@ -118,6 +122,9 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
     out_channels_ = bias.shape[0]
+    # Constants
+    NUM_FILTERS = out_channels
+
 
     assert (
         in_channels_ == in_channels and out_channels_ == out_channels
@@ -143,7 +150,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # )
 
     X_out = nl.ndarray(
-        shape=(batch_size, out_channels * filter_height * filter_width, input_height * input_width, 1),
+        shape=(batch_size, out_channels, out_pool_height, out_pool_width),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
@@ -156,12 +163,53 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
    
     # flatten image
     x_re = X.reshape(shape=(batch_size, in_channels, (input_height * input_width)))
+
     # flatten filters
-    w_re = W.reshape(shape=(out_channels * filter_height * filter_width, in_channels))
+    w_re = W.reshape(shape=(out_channels, filter_height * filter_width, in_channels))
     
-    w_re_T = matrix_transpose(w_re)
+    x_re_T = nl.ndarray(shape=(batch_size, (input_height * input_width), in_channels), dtype=X.dtype, buffer=nl.hbm)
+    # for b in nl.affine_range(batch_size):
+    #     print("o:")
+    #     print(x_re[b].shape)
+    #     out = nl.ndarray((x_re[b].shape), dtype=a_tensor.dtype, buffer=nl.hbm)
+    #     out = matrix_transpose(x_re[b])
+    #     x_re_T[b] = out
+    #     print(x_re_T[b].shape)
+
     for b in nl.affine_range(batch_size):
-        nki_matmul_tiled_(w_re_T, x_re[b], X_out[b]) # lhst, rhs, result
+        out = matrix_transpose(x_re[b])
+        nisa.dma_copy(src=out, dst=x_re_T[b])
+
+    for b in nl.affine_range(batch_size):
+        # tiling the image into filter-size matrixes for mat mul 
+        for m in nl.affine_range(out_height):
+            for n in nl.affine_range(out_width):
+                tile = nl.ndarray(shape=(filter_height, filter_width, input_channels), dtype=X.dtype, buffer=nl.hbm)
+                
+                # Create RELATIVE indices (compile-time constants)
+                # i_p, i_f = nl.mgrid[0:filter_height, 0:filter_width]
+                # linear_idx = (m+i_p)*input_width + (n+i_f)
+                
+                # Add loop variables when indexing (runtime values)
+                nisa.dma_copy(src= x_re_T[b, m*input_width+n:m*input_width+n+filter_height*filter_width, :], dst = tile)
+                tile.reshape()
+                result = nl.ndarray(shape = (filter_height, filter_width), dtype = X.dtype, buffer = nl.psum)
+                for o in nl.affine_range(out_channels):
+
+                    nki_matmul_tiled_(tile, w_re[o], result)
+                    nisa.dma_copy(result, X_out[b, i_p, i_f, o])
+
+                # allocate space for the tiles, 
+                # load the input tiles
+            
+        # # for each filter 
+        # for fil_index in nl.affine_range(NUM_FILTERS):
+        #     # slice out the current filter 
+        #     # allocate space for the filter on SBUF
+        #     # load from W 
+        #     # perform matmul
+        #     nki_matmul_tiled_( , , ) 
+                
 
         
     return X_out
