@@ -155,7 +155,7 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     # # flatten image
     # print("x shape:")
     # print(X.shape)
-    # x_re = X.reshape(shape=(batch_size, in_channels, (input_height * input_width)))
+    # x_re = X.reshape(shape=(batch_size, (input_height * input_width), in_channels))
     # print("x_re shape:")
     # print(x_re.shape)
 
@@ -176,11 +176,33 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     for b in nl.affine_range(batch_size):
         for i in nl.affine_range(filter_height):
             for j in nl.affine_range(filter_width):
-                result = nl.ndarray(shape = ((input_height - filter_height + 1) * (input_width - filter_width + 1), out_channels), dtype = X.dtype, buffer = nl.psum)
-                input_tile = nl.ndarray(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), input_channels), dtype=X.dtype, buffer=nl.hbm)
-                nisa.dma_copy(src= X[b, : , i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1), dst = input_tile)
+                result = nl.ndarray(shape = ((input_height - filter_height + 1) * (input_width - filter_width + 1), out_channels), dtype = X.dtype, buffer = nl.hbm)
+                
+                
+                # input_tile = nl.ndarray(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), in_channels), dtype=X.dtype, buffer=nl.hbm)
+                # NOTE: EVEN if you reshape the entire input image, the indexing is too complicate (actually i dont think it is possible)
+                # instead, we can just copy the slice of the input image and THEN reshape
+                # nisa.dma_copy(src= X[b, : , i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1)], dst = input_tile)
+                
+                # this didnt work because you need to copy the data to an intermediate buffer then reshape that buffer
+                # input_tile = nl.ndarray(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), in_channels), dtype=X.dtype, buffer=nl.hbm)
+                # src_slice = X[b, :, i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1)]
+                # src_reshaped = src_slice.reshape(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), in_channels))
+                # nisa.dma_copy(src=src_reshaped, dst=input_tile)
+                
+                # First, allocate and copy with the original shape
+                input_tile_temp = nl.ndarray(shape=(in_channels, (input_height - filter_height + 1), (input_width - filter_width + 1)), dtype=X.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(src=X[b, :, i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1)], dst=input_tile_temp)
+
+                # Then reshape the copied buffer
+                input_tile = input_tile_temp.reshape(shape=((input_height - filter_height + 1) * (input_width - filter_width + 1), in_channels))
+
                 filter_tile = nl.ndarray(shape=(out_channels, in_channels), dtype=W.dtype, buffer=nl.hbm)
                 nisa.dma_copy(src= W[ : , : , i : i + 1, j : j+ 1], dst = filter_tile)
+                print("filter_tile shape:")
+                print(filter_tile.shape)
+                print("input_tile shape:")
+                print(input_tile.shape)
                 nki_matmul_tiled_(filter_tile, input_tile, result)
                 # add the result to the output
                 nisa.dma_copy(src=result, dst=X_out[b, :, i : i + (input_height - filter_height + 1), j : j + (input_width - filter_width + 1)], dst_rmw_op=np.add)
