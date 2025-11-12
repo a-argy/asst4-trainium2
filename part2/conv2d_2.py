@@ -478,17 +478,25 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     NUM_FILTERS = out_channels
 
     FILTER_CHUNK = 8
-    HEIGHT_CHUNK = 5
+    # we need to be smart about picking this 
+    # needs to be relative to out_width 
+    # we know outwidth cant be greater than 512
+    # we also know the second two dimensions of of input tile cant exceed 512
+    HEIGHT_CHUNK = 1
+    IN_CHANNEL_CHUNK = 128
+
     assert (
         in_channels_ == in_channels and out_channels_ == out_channels
     ), f"Shape mismatch. {in_channels}, {in_channels_}, {out_channels}, {out_channels_}"
 
     out_height = input_height - filter_height + 1
     out_width = input_width - filter_width + 1
+    print("out_width:")
+    print(out_width)
 
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
-    
+
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == out_channels % 128 == 0
 
@@ -543,7 +551,9 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
         for row in nl.affine_range(out_height // HEIGHT_CHUNK): # 30 / 30 = 1 chunks
             for o_ch in nl.affine_range(out_channels // FILTER_CHUNK): #128 / 8 = 16 chunks
                 # can we assume this is zeroed?
-                res_psum = nl.zeros(shape = (FILTER_CHUNK, HEIGHT_CHUNK * out_width), dtype = X.dtype, buffer = nl.psum)
+                res_psum = nl.zeros(shape = (FILTER_CHUNK, HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
+
+                # res_psum = nl.zeros(shape = (FILTER_CHUNK, HEIGHT_CHUNK * out_width), dtype = X.dtype, buffer = nl.psum)
                 # for z in nl.affine_range(HEIGHT_CHUNK):
                 #     nl.store(dst=res_psum[:, z, :], value=0.0)
 
@@ -556,32 +566,36 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
                         # flat_filter_entry = filter_entry.reshape(shape = (in_channels, 1 * 1))
                         
                         # if we're keepign the input tile 3D, then these dimension look good
+                        print("out_width:")
+                        print(out_width)
+                        print("HEIGHT_CHUNK:")
+                        print(HEIGHT_CHUNK)
+                        print("in_channels:")
+                        print(in_channels)
                         input_tile = nl.ndarray(shape = (in_channels, HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
                         # made a fix here 
                         nisa.dma_copy(dst=input_tile, src=X[b, : , i + (row * HEIGHT_CHUNK) : i + ((row + 1) * HEIGHT_CHUNK), j: j + out_width])
-                        input_tile_flat = input_tile.reshape(shape = (in_channels, HEIGHT_CHUNK * out_width))
+                        # input_tile_flat = input_tile.reshape(shape = (in_channels, HEIGHT_CHUNK * out_width))
                         # so this is a 2d mult with a 3d
                         # res_psum += nisa.nc_matmul(filter_tile, input_tile)
-                        print("filter_tile shape:")
-                        print(filter_tile.shape)
-                        print("input_tile shape:")
-                        print(input_tile.shape)
                         # i think we need to transpose the filter tile
                         filter_tile_transpose = nisa.nc_transpose(data=filter_tile)
                         filter_tile_T = nl.copy(filter_tile_transpose, dtype=filter_tile.dtype)
 
-                        print("filter_tile_transpose shape:")
-                        print(filter_tile_transpose.shape)
+      
                         # a little unsure about 2d x 3d mat mul
                         # result = nisa.nc_matmul(filter_tile_T, input_tile_flat)
-                        print("result shape:")
-                        res_psum += nisa.nc_matmul(filter_tile_T, input_tile_flat)
+                        res_psum += nisa.nc_matmul(filter_tile_T, input_tile)
             # move the result to X_out 
                 # nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, row * HEIGHT_CHUNK : (row + 1) * HEIGHT_CHUNK, : ], src=res_psum)
-                result_2d = nl.copy(res_psum, dtype=X.dtype)
-                result_3d = result_2d.reshape(shape = (FILTER_CHUNK, HEIGHT_CHUNK, out_width))
+                result_sbuf = nl.copy(res_psum, dtype=X.dtype)
+                print("result_sbuf shape:")
+                print(result_sbuf.shape)
+                print("X_out shape:")
+                print(X_out.shape)
+                # result_3d = result_2d.reshape(shape = (FILTER_CHUNK, HEIGHT_CHUNK, out_width))
                 # nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, : , : ], src=result_3d)
-                nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, row * HEIGHT_CHUNK : (row + 1) * HEIGHT_CHUNK, : ], src=result_3d)
+                nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, row * HEIGHT_CHUNK : (row + 1) * HEIGHT_CHUNK, : ], src=result_sbuf)
 
             
     return X_out
