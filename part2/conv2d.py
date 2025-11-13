@@ -125,7 +125,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Constants
     NUM_FILTERS = out_channels
 
-
+    OUT_CHUNK = 128 
+    ROW_CHUNK = 1
     assert (
         in_channels_ == in_channels and out_channels_ == out_channels
     ), f"Shape mismatch. {in_channels}, {in_channels_}, {out_channels}, {out_channels_}"
@@ -166,58 +167,39 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # flatten filters
     w_re = W.reshape(shape=(out_channels, filter_height * filter_width, in_channels))
     
-    x_T = nl.ndarray(shape=(batch_size, input_width, input_height, in_channels), dtype=X.dtype, buffer=nl.hbm)
+    # x_T = nl.ndarray(shape=(batch_size, input_width, input_height, in_channels), dtype=X.dtype, buffer=nl.hbm)
     # Allocate buffer in SBUF with the same shape
     # X_sbuf = nl.ndarray(shape=(batch_size, input_height, input_width, in_channels), dtype=X.dtype, buffer=nl.sbuf)
 
     # DMA copy from HBM to SBUF
     
     # x_T = nl.transpose(X_buf, axes=(0, 2, 3, 1))
-    for b in nl.affine_range(batch_size):
-        for i in nl.affine_range(in_channels):
-            for m in nl.affine_range(out_height):
-                for n in nl.affine_range(out_width):
-                    nisa.dma_copy(src = X[b,i,m,n], dst = x_T[b,n,m,i]) 
+    # for b in nl.affine_range(batch_size):
+    #     for i in nl.affine_range(in_channels):
+    #         for m in nl.affine_range(out_height):
+    #             for n in nl.affine_range(out_width):
+    #                 nisa.dma_copy(src = X[b,i,m,n], dst = x_T[b,m,n,i]) 
     
     for b in nl.affine_range(batch_size):
-        # tiling the image into filter-size matrixes for mat mul 
-        for m in nl.affine_range(out_height):
-            for n in nl.affine_range(out_width):
-                tile = nl.ndarray(shape=(filter_height, filter_width, in_channels), dtype=X.dtype, buffer=nl.hbm)
-                
-                # Add loop variables when indexing (runtime values)
-                nisa.dma_copy(src= x_T[b, n: n + filter_width, m: m + filter_height, :], dst = tile)
-                tile_input_height, tile_input_width, tile_in_channels = tile.shape
-                flat_tile = tile.reshape((tile_input_height * tile_input_width, tile_in_channels))
-                result = nl.ndarray(shape = (filter_height * filter_width, filter_height * filter_width), dtype = X.dtype, buffer = nl.psum)
-                for o in nl.affine_range(out_channels):
-
-                    nki_matmul_tiled_(flat_tile, w_re[o], result)
-                    
-                    # sum up result into X_out
-                    # Step 1: Reduce over axis=1 (non-partition axis)
-                    partial = nl.zeros((result.shape[0], 1), dtype=result.dtype, buffer=nl.sbuf)
-                    partial = nisa.tensor_reduce(op=nl.add, data=result, axis=1)
-
-                    # Step 2: Reduce manually over axis=0 (partition axis)
-                    total = nl.zeros((1, 1), dtype=result.dtype, buffer=nl.sbuf)
-                    for i in nl.affine_range(result.shape[0]):
-                        nisa.tensor_scalar(op0=nl.add, data=total[0, 0], operand0=partial[i, 0])
-
-
-                    # 1. Allocate temp buffer in SBUF
-                    temp_out = nl.zeros((1, 1), dtype=X_out.dtype, buffer=nl.sbuf)
-
-                    # 2. Copy from HBM to SBUF
-                    nisa.dma_copy(dst=temp_out, src=X_out[b, o, m, n])
-
-                    # 3. Apply tensor_scalar
-                    nisa.tensor_scalar(data=temp_out, operand0=total[0, 0], op0=nl.add)
-
-                    # 4. Copy back to HBM
-                    nisa.dma_copy(dst=X_out[b, o, m, n], src=temp_out)
+            # WILL NEED TO tiling the image into filter-size matrixes for mat mul 
+        #for ch in nl.affine_range(input_height * input_width // out_height * out_width)
+        for row in nl.affine_range(out_height // ROW_CHUNK):
+            res_psum = nl.ndarray(shape = (OUT_CHUNK, ROW_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
+            for o_ch in nl.affine_range(out_channels // OUT_CHUNK):
+                for i in nl.affine_range(input_height - out_height):
+                    for j in nl.affine_range(filter_width):
+                        filter_entry = nl.ndarray(shape = (OUT_CHUNK, in_channels), dtype = X.dtype, buffer = nl.sbuf)
+                        nisa.dma_copy(dst=filter_entry, src = W[o_ch: o_ch + OUT_CHUNK, :, i, j])
+                        # flat_filter_entry = filter_entry.reshape(shape = (in_channels, 1 * 1))
+                        
+                        image_entry = nl.ndarray(shape = (in_channels, ROW_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
+                        nisa.dma_copy(dst=image_entry, src=X[b, :, i: i + ROW_CHUNK, j: j + out_width])
+                        # flat_image_entry = image_entry.reshape(shape = (in_channels, out_height * out_width))
+                        res_psum += nisa.nc_matmul(filter_entry, image_entry)
+            # move the result to X_out 
+            nisa.dma_copy(dst=X_out[b,o_ch: o_ch + OUT_CHUNK, row], src=res_psum)
+        
 
             
-        
     return X_out
 
