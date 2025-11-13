@@ -35,6 +35,8 @@ The shape of the output should be [batch_size, out_channels, out_pool_height, ou
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
+    print(X.shape)
+    print(W.shape)
 
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
@@ -56,10 +58,23 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
 
-    # we need to be smart about picking this 
+    # we need to be smart about picking these constants 
     # the product of the last two dimensions in the matmul can't exceed nl.tile_size.gemm_moving_fmax
-    HEIGHT_CHUNK = min((MAX_WIDTH // out_width), out_height)
-    # this dimensino can be at most 128 in the matmul
+    # HEIGHT_CHUNK = min((MAX_WIDTH // out_width), out_height)
+    # if (out_height // 4) > HEIGHT_CHUNK:
+    #     BIG_HEIGHT_CHUNK = out_height // 4
+    #     SMALL_HEIGHT_CHUNK = HEIGHT_CHUNK
+    # else:
+    #     BIG_HEIGHT_CHUNK  = out_height
+    #     SMALL_HEIGHT_CHUNK = HEIGHT_CHUNK
+
+    # SMALL_HEIGHT_CHUNK = min(MAX_WIDTH // out_width, out_height)
+    # BIG_HEIGHT_CHUNK   = min(out_height, SMALL_HEIGHT_CHUNK * 2)
+
+    SMALL_HEIGHT_CHUNK = 2
+    BIG_HEIGHT_CHUNK   = 2
+
+    # this dimensinon can be at most 128 in the matmul
     IN_CHANNEL_CHUNK = min(128, in_channels)
 
     # Can assume multiple of 128 to avoid using mask
@@ -80,36 +95,56 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     k = out_channels // (filter_height * filter_height)
 
     for b in nl.affine_range(batch_size):
-        for row in nl.affine_range(out_height // HEIGHT_CHUNK): 
-            for o_ch in nl.affine_range(out_channels // FILTER_CHUNK): 
-                # initalize with zeros in psum
-                res_psum = nl.zeros(shape = (FILTER_CHUNK, HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
+        for o_ch in nl.affine_range(out_channels // FILTER_CHUNK): 
+            for big_row in nl.affine_range(out_height // BIG_HEIGHT_CHUNK): 
+                # i really want this loop inside of channels because then we can apply bias 
+                # and maxpooling for each output channel once only. This may create some data
+                # transferring in efficienceis
 
-                # chunk input channels after defining res_psum because we are contracting on this dimension
-                for in_ch in nl.affine_range(in_channels // IN_CHANNEL_CHUNK):
-                    for i in nl.affine_range(filter_height):
-                        for j in nl.affine_range(filter_width):
-                            # create the filter tile and copy in data
-                            # filter tile is split by output channel & input channel
-                            filter_tile = nl.ndarray(shape = (FILTER_CHUNK, IN_CHANNEL_CHUNK), dtype = X.dtype, buffer = nl.sbuf)
-                            nisa.dma_copy(dst=filter_tile, src = W[o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, in_ch * IN_CHANNEL_CHUNK : (in_ch + 1) * IN_CHANNEL_CHUNK, i, j])
-                            
-                            # tranpose the filter and copy back to sbuf
-                            filter_tile_transpose_psum = nisa.nc_transpose(data=filter_tile)
-                            filter_tile_transpose = nl.copy(filter_tile_transpose_psum, dtype=filter_tile.dtype)
+                oversized_res_sbuf = nl.ndarray(shape = (FILTER_CHUNK, BIG_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
 
-                            # create the input tile and copy in data
-                            # input tile is split by input channel & height
-                            input_tile = nl.ndarray(shape = (IN_CHANNEL_CHUNK, HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
-                            nisa.dma_copy(dst=input_tile, src=X[b, in_ch * IN_CHANNEL_CHUNK : (in_ch + 1) * IN_CHANNEL_CHUNK, i + (row * HEIGHT_CHUNK) : i + ((row + 1) * HEIGHT_CHUNK), j: j + out_width])
+                # copy the bias into sbuf to be used broadcast through the sbuf result at the end of this iteration
+                bias_tile = nl.ndarray(shape = (FILTER_CHUNK, 1), dtype = X.dtype, buffer = nl.sbuf)
+                nisa.dma_copy(dst=bias_tile, src = bias[o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK])
 
-                            # 2d x 3d mat mul
-                            res_psum += nisa.nc_matmul(filter_tile_transpose, input_tile)
-                
-                # move the accumulation from psum to sbuf
-                result_sbuf = nl.copy(res_psum, dtype=X.dtype)
+                for small_row in nl.affine_range(BIG_HEIGHT_CHUNK // SMALL_HEIGHT_CHUNK): 
+
+                    # initalize with zeros in psum
+                    res_psum = nl.zeros(shape = (FILTER_CHUNK, SMALL_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
+
+                    # chunk input channels after defining res_psum because we are contracting on this dimension
+                    for in_ch in nl.affine_range(in_channels // IN_CHANNEL_CHUNK):
+                        for i in nl.affine_range(filter_height):
+                            for j in nl.affine_range(filter_width):
+                                # create the filter tile and copy in data
+                                # filter tile is split by output channel & input channel
+                                filter_tile = nl.ndarray(shape = (FILTER_CHUNK, IN_CHANNEL_CHUNK), dtype = X.dtype, buffer = nl.sbuf)
+                                nisa.dma_copy(dst=filter_tile, src = W[o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, in_ch * IN_CHANNEL_CHUNK : (in_ch + 1) * IN_CHANNEL_CHUNK, i, j])
+                                
+                                # tranpose the filter and copy back to sbuf
+                                filter_tile_transpose_psum = nisa.nc_transpose(data=filter_tile)
+                                filter_tile_transpose = nl.copy(filter_tile_transpose_psum, dtype=filter_tile.dtype)
+
+                                # create the input tile and copy in data
+                                # input tile is split by input channel & height
+                                input_tile = nl.ndarray(shape = (IN_CHANNEL_CHUNK, SMALL_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
+                                nisa.dma_copy(dst=input_tile, src=X[b, in_ch * IN_CHANNEL_CHUNK : (in_ch + 1) * IN_CHANNEL_CHUNK, i + (big_row * BIG_HEIGHT_CHUNK) + (small_row * SMALL_HEIGHT_CHUNK) : i + (big_row * BIG_HEIGHT_CHUNK) + ((small_row + 1) * SMALL_HEIGHT_CHUNK), j: j + out_width])
+
+                                # 2d x 3d mat mul
+                                res_psum += nisa.nc_matmul(filter_tile_transpose, input_tile)
+                    
+                    # move the accumulation from psum to oversized sbuf
+                    oversized_res_sbuf[ : , small_row * SMALL_HEIGHT_CHUNK : (small_row + 1) * SMALL_HEIGHT_CHUNK, : ] = nl.copy(res_psum)
+
+                # the free dimensino of sbuf (single bias) is stretched acorss the free dimension of result (hieght x width)
+                # (this note was before the move) : possible inefficiency here because this touches each bias more than once, given we are chunking
+                # by HEIGHT_CHUNK on the outside of this loop, BUT we can't fit a tile into psum without chunking...
+                oversized_res_sbuf = nisa.tensor_scalar(oversized_res_sbuf, np.add, bias_tile)
+
                 # write the accumulation to the correct position in X_out
-                nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, row * HEIGHT_CHUNK : (row + 1) * HEIGHT_CHUNK, : ], src=result_sbuf)
-    
-    return X_out
+                nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, big_row * BIG_HEIGHT_CHUNK : (1 + big_row) * BIG_HEIGHT_CHUNK, : ], src=oversized_res_sbuf)
 
+    #nki.language.maximum
+
+
+    return X_out
