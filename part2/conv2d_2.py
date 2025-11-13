@@ -140,6 +140,8 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
                 # (this note was before the move) : possible inefficiency here because this touches each bias more than once, given we are chunking
                 # by HEIGHT_CHUNK on the outside of this loop, BUT we can't fit a tile into psum without chunking...
                 oversized_res_sbuf = nisa.tensor_scalar(oversized_res_sbuf, np.add, bias_tile)
+                # maxpool happens here 
+                # oversized_res_sbuf = nisa.tensor_reduce(op=nki.language.maximum, data=oversized_res_sbuf)
 
                 # write the accumulation to the correct position in X_out
                 nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, big_row * BIG_HEIGHT_CHUNK : (1 + big_row) * BIG_HEIGHT_CHUNK, : ], src=oversized_res_sbuf)
