@@ -61,6 +61,8 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     # we need to be smart about picking these constants 
     # the product of the last two dimensions in the matmul can't exceed nl.tile_size.gemm_moving_fmax
     # HEIGHT_CHUNK = min((MAX_WIDTH // out_width), out_height)
+    
+    
     # if (out_height // 4) > HEIGHT_CHUNK:
     #     BIG_HEIGHT_CHUNK = out_height // 4
     #     SMALL_HEIGHT_CHUNK = HEIGHT_CHUNK
@@ -72,7 +74,7 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     # BIG_HEIGHT_CHUNK   = min(out_height, SMALL_HEIGHT_CHUNK * 2)
 
     SMALL_HEIGHT_CHUNK = 2
-    BIG_HEIGHT_CHUNK   = 2
+    BIG_HEIGHT_CHUNK   = 6
 
     # this dimensinon can be at most 128 in the matmul
     IN_CHANNEL_CHUNK = min(128, in_channels)
@@ -104,13 +106,13 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
                 oversized_res_sbuf = nl.ndarray(shape = (FILTER_CHUNK, BIG_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
 
                 # copy the bias into sbuf to be used broadcast through the sbuf result at the end of this iteration
-                bias_tile = nl.ndarray(shape = (FILTER_CHUNK, 1), dtype = X.dtype, buffer = nl.sbuf)
+                bias_tile = nl.ndarray(shape = (FILTER_CHUNK, 1), dtype=nl.float32, buffer = nl.sbuf)
                 nisa.dma_copy(dst=bias_tile, src = bias[o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK])
 
                 for small_row in nl.affine_range(BIG_HEIGHT_CHUNK // SMALL_HEIGHT_CHUNK): 
 
                     # initalize with zeros in psum
-                    res_psum = nl.zeros(shape = (FILTER_CHUNK, SMALL_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
+                    res_psum = nl.zeros(shape = (FILTER_CHUNK, SMALL_HEIGHT_CHUNK, out_width), dtype = nl.float32, buffer = nl.psum)
 
                     # chunk input channels after defining res_psum because we are contracting on this dimension
                     for in_ch in nl.affine_range(in_channels // IN_CHANNEL_CHUNK):
@@ -141,12 +143,18 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
                 # by HEIGHT_CHUNK on the outside of this loop, BUT we can't fit a tile into psum without chunking...
                 oversized_res_sbuf = nisa.tensor_scalar(oversized_res_sbuf, np.add, bias_tile)
                 # maxpool happens here 
-                # oversized_res_sbuf = nisa.tensor_reduce(op=nki.language.maximum, data=oversized_res_sbuf)
-
-                # write the accumulation to the correct position in X_out
-                nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, big_row * BIG_HEIGHT_CHUNK : (1 + big_row) * BIG_HEIGHT_CHUNK, : ], src=oversized_res_sbuf)
-
-    #nki.language.maximum
+                if pool_size == 2:
+                    # oversized_res_sbuf = nl.ndarray(shape = (FILTER_CHUNK, BIG_HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.sbuf)
+                    POOL_HEIGHT = pool_size
+                    POOL_WIDTH = pool_size
+                    oversized_res_sbuf = oversized_res_sbuf.reshape(shape = (FILTER_CHUNK, (BIG_HEIGHT_CHUNK // POOL_HEIGHT), POOL_HEIGHT, (out_width // POOL_WIDTH), POOL_WIDTH))
+                    oversized_res_sbuf = nisa.tensor_reduce(op=nki.language.maximum, data=oversized_res_sbuf, axis=(2,4))
+                    # oversized_res_sbuf = oversized_res_sbuf.reshape(shape = (FILTER_CHUNK, BIG_HEIGHT_CHUNK, out_width))
+                    nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, big_row * (BIG_HEIGHT_CHUNK // POOL_HEIGHT) : (1 + big_row) * (BIG_HEIGHT_CHUNK // POOL_HEIGHT), 0 : (out_width // POOL_WIDTH)], src=oversized_res_sbuf)
+                   
+                else: 
+                    nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, big_row * BIG_HEIGHT_CHUNK : (1 + big_row) * BIG_HEIGHT_CHUNK, : ], src=oversized_res_sbuf)
 
 
     return X_out
+    
