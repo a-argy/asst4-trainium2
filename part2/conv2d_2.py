@@ -41,11 +41,10 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     out_channels_ = bias.shape[0]
     # Constants
     NUM_FILTERS = out_channels
+    MAX_WIDTH = nl.tile_size.gemm_moving_fmax
+    # this is maxxed out, there might be an intelligent way to set this dynamically
+    FILTER_CHUNK = 128
 
-    FILTER_CHUNK = 8
-    # we need to be smart about picking this 
-    HEIGHT_CHUNK = 15
-    IN_CHANNEL_CHUNK = 128
 
     assert (
         in_channels_ == in_channels and out_channels_ == out_channels
@@ -56,6 +55,12 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
 
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
+
+    # we need to be smart about picking this 
+    # the product of the last two dimensions in the matmul can't exceed nl.tile_size.gemm_moving_fmax
+    HEIGHT_CHUNK = min((MAX_WIDTH // out_width), out_height)
+    # this dimensino can be at most 128 in the matmul
+    IN_CHANNEL_CHUNK = min(128, in_channels)
 
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == out_channels % 128 == 0
@@ -73,13 +78,14 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
     k = out_channels // (filter_height * filter_height)
-    
+
     for b in nl.affine_range(batch_size):
         for row in nl.affine_range(out_height // HEIGHT_CHUNK): 
             for o_ch in nl.affine_range(out_channels // FILTER_CHUNK): 
-                # initalize with zeros
+                # initalize with zeros in psum
                 res_psum = nl.zeros(shape = (FILTER_CHUNK, HEIGHT_CHUNK, out_width), dtype = X.dtype, buffer = nl.psum)
 
+                # chunk input channels after defining res_psum because we are contracting on this dimension
                 for in_ch in nl.affine_range(in_channels // IN_CHANNEL_CHUNK):
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
@@ -102,7 +108,7 @@ def fused_conv2d_maxpool_2(X, W, bias, pool_size=1):
                 
                 # move the accumulation from psum to sbuf
                 result_sbuf = nl.copy(res_psum, dtype=X.dtype)
-                # write to the correct position in X_out
+                # write the accumulation to the correct position in X_out
                 nisa.dma_copy(dst=X_out[b, o_ch * FILTER_CHUNK : (o_ch + 1) * FILTER_CHUNK, row * HEIGHT_CHUNK : (row + 1) * HEIGHT_CHUNK, : ], src=result_sbuf)
     
     return X_out
