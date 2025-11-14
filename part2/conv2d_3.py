@@ -71,12 +71,12 @@ def fused_conv2d_maxpool_3(X, W, bias, pool_size=1):
     # SMALL_HEIGHT_CHUNK = min(MAX_WIDTH // out_width, out_height)
     # BIG_HEIGHT_CHUNK   = min(out_height, SMALL_HEIGHT_CHUNK * 2)
 
-    # if input_width * input_height <= 512:
-    #     SMALL_HEIGHT_CHUNK = out_height
-    #     BIG_HEIGHT_CHUNK   = 1
-    # else:
-    SMALL_HEIGHT_CHUNK = 2
-    BIG_HEIGHT_CHUNK   = 6
+    if input_width * input_height <= 512:
+        SMALL_HEIGHT_CHUNK = out_height
+        BIG_HEIGHT_CHUNK   = out_height
+    else:
+        SMALL_HEIGHT_CHUNK = 2
+        BIG_HEIGHT_CHUNK   = 6
     POOL_HEIGHT = pool_size
     POOL_WIDTH = pool_size
 
